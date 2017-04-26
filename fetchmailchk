@@ -1,0 +1,144 @@
+#!/usr/bin/perl
+# fetchmailchk
+# Copyright (C) Eskild Hustvedt 2017
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+use 5.020;
+use warnings;
+use Getopt::Long;
+use JSON qw(decode_json);
+use experimental 'signatures';
+
+my $verbosity = 0;
+
+# Purpose: Exits the program, outputting a reason if verbosity is >= $minVerbosity
+sub exitWithReason($exitVal,$reason,$minVerbosity = 1)
+{
+    if ($verbosity >= $minVerbosity)
+    {
+        say $reason;
+    }
+    exit($exitVal);
+}
+
+# Purpose: Reads from journald, will read $hours back in time
+sub journaldReader($hours)
+{
+    if (!defined($hours) || $hours < 1)
+    {
+        $hours = 8;
+    }
+    my $data = {};
+    open(my $in,'-|',qw(journalctl --boot --user --identifier=fetchmail --no-pager --output=json),'--since=-'.$hours.'h');
+    while(my $entry = <$in>)
+    {
+        my $content = decode_json($entry);
+        my $PID = $content->{SYSLOG_PID};
+        if (!$data->{$PID})
+        {
+            $data->{$PID} = {
+                messages => [],
+            };
+        }
+        my $timestamp = $content->{_SOURCE_REALTIME_TIMESTAMP} / 1000000;
+        if ($content->{MESSAGE} =~ /^(reading message|starting fetchmail)/)
+        {
+            $data->{$PID}->{lastOK} = $timestamp;
+        }
+        push(@{$data->{$PID}->{messages}},{
+                message => $content->{MESSAGE},
+                timestamp => $timestamp,
+            });
+    }
+    close($in);
+    return $data;
+}
+
+# Purpose: Read a fetchmail-style pidfile and return the pid
+sub getPIDfromPidfile($pidfile)
+{
+    open(my $in,'<',$pidfile) or die;
+    my $firstLine = <$in>;
+    close($in);
+    chomp($firstLine);
+    if ($firstLine =~ /\D/ || length($firstLine) < 1)
+    {
+        die("Invalid pidfile: $pidfile\n");
+    }
+    return $firstLine;
+}
+
+# Purpose: Actually verify that a fetchmail instance is alive
+# Will exit fetchmailchk with nonzero on failure, zero on success
+sub checkInstance($pidfile,$hours)
+{
+    my $PID = getPIDfromPidfile($pidfile);
+    if (!kill(0,$PID))
+    {
+        exitWithReason(3,$PID.' is either not alive or owned by another user');
+    }
+    my $data = journaldReader($hours);
+    if (!$data->{$PID})
+    {
+        exitWithReason(1,'No log entries found for PID '.$PID.' within the specified timeframe');
+    }
+    elsif(!$data->{$PID}->{lastOK})
+    {
+        exitWithReason(2,'No log entries that indicate that '.$PID.' is working could be found within the specified timeframe.');
+    }
+    exitWithReason(0,$PID.' appears to be alive and well',2);
+}
+
+# Purpose: Handle command-line parsing
+sub main
+{
+    my $pidfile;
+    my $hours;
+    Getopt::Long::Configure('no_ignore_case','bundling');
+    GetOptions(
+        'help' => sub {
+            die;
+        },
+        'version' => sub
+        {
+            die;
+        },
+        'v|verbose+' => \$verbosity,
+        'p|pid|pidfile|pid-file=s' => \$pidfile,
+        'hours=i' => \$hours,
+    );
+    if (!$pidfile)
+    {
+        die('--pidfile is required'."\n");
+    }
+    if (-d $pidfile)
+    {
+        if (-e $pidfile.'/.fetchmail.pid')
+        {
+            $pidfile .= '/.fetchmail.pid';
+        }
+        else
+        {
+            die($pidfile.': is a directory (and does not contain .fetchmail.pid');
+        }
+    }
+    if (!-e $pidfile)
+    {
+        die($pidfile.': does not exist');
+    }
+    checkInstance($pidfile,$hours);
+}
+
+main();
